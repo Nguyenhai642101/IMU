@@ -22,7 +22,14 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-module sm5800_msg_parser (
+module sm5800_msg_parser #(
+    // Extra watchdog time after start-up / soft reset / RESET_L release: the
+    // SM-5800 sends only flags until power-up BIT ends (< 0.8 s, Sec. 5.1/6.4)
+    parameter integer C_ACTIVATION_GRACE_US = 1_000_000,
+    // Extra watchdog time after BIT_L release: results <= 0.2 s after BIT
+    // start, normal output <= 0.1 s after release (Sec. 6.3.2)
+    parameter integer C_BIT_GRACE_US        = 300_000
+) (
     input  wire        clk_i,                // System clock (s_axi_aclk)
     input  wire        rst_ni,               // Synchronous active-low reset
     input  wire        soft_rst_i,           // Synchronous soft reset pulse
@@ -178,6 +185,9 @@ module sm5800_msg_parser (
     reg        data_active_r;
     reg        wd_armed_r;      // 1: watchdog counting (armed at reset & on each valid frame)
     reg        inhibit_wd_d1_r; // Previous cycle state of (imu_reset_active_i || bit_cmd_active_i)
+    reg        imu_reset_d1_r;  // Previous cycle imu_reset_active_i (release detect)
+    reg        bit_cmd_d1_r;    // Previous cycle bit_cmd_active_i (release detect)
+    reg [31:0] wd_grace_us_r;   // Extra watchdog time until the first valid frame
 
     reg [31:0] msg1_rx_cnt_r;
     reg [31:0] msg2_rx_cnt_r;
@@ -205,6 +215,11 @@ module sm5800_msg_parser (
     wire       stg_fault_w;
     wire [3:0] expected_seq_w;
     wire       inhibit_wd_w;
+    wire       wd_frame_ok_w;
+    wire [32:0] wd_limit_w;
+
+    localparam [31:0] P_ACT_GRACE_US = C_ACTIVATION_GRACE_US;
+    localparam [31:0] P_BIT_GRACE_US = C_BIT_GRACE_US;
 
     assign align_ok_w     = !frame_align_err_i;
     assign crc_pass_w     = frame_crc_ok_i || crc_bypass_i;
@@ -221,6 +236,11 @@ module sm5800_msg_parser (
     assign stg_fault_w    = (|stg_status_word1_r[7:4]) || (|stg_status_word2_r[15:11]);
     assign expected_seq_w = prev_seq_cnt_r + 4'd1;
     assign inhibit_wd_w   = imu_reset_active_i || bit_cmd_active_i;
+    // Valid frame of the selected stream (resets the data watchdog)
+    assign wd_frame_ok_w  = frame_end_i && frame_valid_w &&
+                            (msg2_only_mode_i ? is_msg2_w : (msg1_only_mode_i ? is_msg1_w : 1'b1));
+    // 33-bit sum: no wrap-around for any TIMEOUT_CFG + grace combination
+    assign wd_limit_w     = {1'b0, timeout_us_i} + {1'b0, wd_grace_us_r};
 
     //--------------------------------------------------------------------------
     // Staging Buffer Byte Collector
@@ -487,6 +507,9 @@ module sm5800_msg_parser (
             data_active_r        <= 1'b0;
             wd_armed_r           <= 1'b1; // detect a sensor that never sends data
             inhibit_wd_d1_r      <= 1'b0;
+            imu_reset_d1_r       <= 1'b0;
+            bit_cmd_d1_r         <= 1'b0;
+            wd_grace_us_r        <= P_ACT_GRACE_US; // sensor may still be starting
             link_timeout_pulse_r <= 1'b0;
         end else if (soft_rst_i) begin
             flag_idle_us_r       <= 16'd0;
@@ -495,10 +518,27 @@ module sm5800_msg_parser (
             data_active_r        <= 1'b0;
             wd_armed_r           <= 1'b1;
             inhibit_wd_d1_r      <= 1'b0;
+            imu_reset_d1_r       <= 1'b0;
+            bit_cmd_d1_r         <= 1'b0;
+            wd_grace_us_r        <= P_ACT_GRACE_US;
             link_timeout_pulse_r <= 1'b0;
         end else begin
             link_timeout_pulse_r <= 1'b0;
             inhibit_wd_d1_r      <= inhibit_wd_w;
+            imu_reset_d1_r       <= imu_reset_active_i;
+            bit_cmd_d1_r         <= bit_cmd_active_i;
+
+            // Datasheet grace: cleared by the first valid frame; reloaded when
+            // RESET_L (sensor restarts) or BIT_L (BIT completes) is released
+            if (wd_frame_ok_w) begin
+                wd_grace_us_r <= 32'd0;
+            end else if (imu_reset_d1_r && !imu_reset_active_i) begin
+                wd_grace_us_r <= P_ACT_GRACE_US;
+            end else if (bit_cmd_d1_r && !bit_cmd_active_i) begin
+                // Keep the longer window if a start-up grace is still running
+                wd_grace_us_r <= (wd_grace_us_r > P_BIT_GRACE_US) ? wd_grace_us_r
+                                                                  : P_BIT_GRACE_US;
+            end
 
             // SDLC Flag (0x7E) presence monitor (alive during normal op, Power-Up & Cmd BIT)
             if (flag_detected_i) begin
@@ -513,8 +553,7 @@ module sm5800_msg_parser (
             end
 
             // Valid data stream watchdog (filters by MSG2_ONLY / MSG1_ONLY mode)
-            if (frame_end_i && frame_valid_w &&
-                (msg2_only_mode_i ? is_msg2_w : (msg1_only_mode_i ? is_msg1_w : 1'b1))) begin
+            if (wd_frame_ok_w) begin
                 data_idle_us_r <= 32'd0;
                 data_active_r  <= 1'b1;
                 wd_armed_r     <= 1'b1;
@@ -526,7 +565,7 @@ module sm5800_msg_parser (
             end else if (tick_1us_i && wd_armed_r && (timeout_us_i != 32'd0)) begin
                 // Armed from reset (start-up silence) and after every valid frame;
                 // one-shot: disarms on expiry until the next valid frame arrives.
-                if (data_idle_us_r >= timeout_us_i) begin
+                if ({1'b0, data_idle_us_r} >= wd_limit_w) begin
                     data_active_r <= 1'b0;
                     wd_armed_r    <= 1'b0;
                     // Suppress false timeout IRQ during intentional IMU reset or Commanded BIT

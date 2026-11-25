@@ -26,6 +26,8 @@ module sm5800_imu_axi_top #(
     parameter integer C_DEFAULT_MSG1_ONLY  = 0,           // 1: default to Msg ID 01-only mode
     parameter integer C_DEFAULT_MSG2_ONLY  = 0,           // 1: default to Msg ID 02-only mode (100 Hz)
     parameter integer C_DEFAULT_TIMEOUT_US = 30000,       // Data watchdog (us): 3x the 10 ms Msg 02 period
+    parameter integer C_ACTIVATION_GRACE_US = 1_000_000,  // Extra watchdog time after start-up / RESET_L (us)
+    parameter integer C_BIT_GRACE_US       = 300_000,     // Extra watchdog time after BIT_L release (us)
     parameter integer C_S_AXI_DATA_WIDTH   = 32,          // AXI4-Lite data width (32)
     parameter integer C_S_AXI_ADDR_WIDTH   = 8            // AXI4-Lite addr width (>=8)
 ) (
@@ -79,13 +81,16 @@ module sm5800_imu_axi_top #(
     // Elaboration-time parameter guard (Verilog-2001 has no $error):
     // in 100 Hz MSG2_ONLY mode a watchdog shorter than 12 ms (1.2x the 10 ms
     // Msg 02 period) would raise a false LINK_TIMEOUT on every frame. Such a
-    // configuration instantiates a module that does not exist, so synthesis /
-    // simulation stops with an error naming the problem.
+    // configuration connects a non-existent port of the empty module
+    // sm5800_param_error, so synthesis / simulation stops with an error naming
+    // the problem (see rtl/sm5800_param_error.v).
     //--------------------------------------------------------------------------
     generate
         if ((C_DEFAULT_MSG2_ONLY != 0) && (C_DEFAULT_TIMEOUT_US != 0) &&
             (C_DEFAULT_TIMEOUT_US < 12000)) begin : g_param_check
-            SM5800_PARAM_ERROR_TIMEOUT_US_BELOW_12000_IN_MSG2_ONLY_MODE u_param_error ();
+            /* verilator lint_off PINNOTFOUND */
+            sm5800_param_error u_param_error (.SM5800_PARAM_ERROR_TIMEOUT_US_BELOW_12000_IN_MSG2_ONLY_MODE(1'b0));
+            /* verilator lint_on PINNOTFOUND */
         end
     endgenerate
 
@@ -225,7 +230,10 @@ module sm5800_imu_axi_top #(
     //--------------------------------------------------------------------------
     // 3. SM-5800 Message Validator, Parser, Watchdog & Diagnostics
     //--------------------------------------------------------------------------
-    sm5800_msg_parser u_msg_parser (
+    sm5800_msg_parser #(
+        .C_ACTIVATION_GRACE_US (C_ACTIVATION_GRACE_US),
+        .C_BIT_GRACE_US        (C_BIT_GRACE_US)
+    ) u_msg_parser (
         .clk_i                (s_axi_aclk),
         .rst_ni               (s_axi_aresetn),
         .soft_rst_i           (ctrl_soft_rst_w),

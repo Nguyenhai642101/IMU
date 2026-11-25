@@ -38,6 +38,7 @@ $reqFiles = @(
     "Makefile",
     ".gitignore",
     "rtl/sm5800_filelist.f",
+    "rtl/sm5800_param_error.v",
     "rtl/sm5800_crc16_ccitt.v",
     "rtl/sm5800_clk_ctrl.v",
     "rtl/sm5800_sdlc_rx.v",
@@ -122,6 +123,10 @@ foreach ($f in ($rtlFiles + $tbFiles)) {
     $noBlk = [regex]::Replace($raw, '/\*[\s\S]*?\*/', '')
     $codeOnly = (($noBlk -split "`n") | ForEach-Object { $_ -replace '//.*', '' }) -join "`n"
     foreach ($mName in $modPorts.Keys) {
+        # sm5800_param_error is the parameter-guard target: its instances
+        # connect a deliberately missing port and only exist for ILLEGAL
+        # configurations (see rtl/sm5800_param_error.v), so they are exempt.
+        if ($mName -eq 'sm5800_param_error') { continue }
         $pattern = "(?<!module\s+)\b$mName\b\s*(?:#\s*\([^;]*?\)\s*)?(u_\w+)\s*\(([^;]*?)\);"
         foreach ($m in [regex]::Matches($codeOnly, $pattern)) {
             $instName = $m.Groups[1].Value

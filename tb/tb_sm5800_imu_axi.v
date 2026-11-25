@@ -21,6 +21,8 @@
 //               [T15] Watchdog start-up silence, one-shot, re-arm, safe default
 //               [T16] PL-PS IRQ timing, RESET_BUSY, fault gating, LAST_SEQ,
 //                     watchdog re-arm after BIT, 1 us tick rounding
+//               [T17] irq_o re-arm: new rising edge after a partial W1C
+//               [T18] Watchdog grace after start-up / RESET_L / Commanded BIT
 //==============================================================================
 
 `timescale 1ns / 1ps
@@ -110,6 +112,7 @@ module tb_sm5800_imu_axi;
     integer     test_pass_cnt;
     integer     msg1_pin_cnt;
     integer     t14_pin_base;
+    integer     t17_rise_base;
     integer     msg2_pin_cnt;
     reg  [31:0] rd_val;
     integer     i;
@@ -124,6 +127,8 @@ module tb_sm5800_imu_axi;
         .C_CLK_FREQ_HZ        (C_CLK_FREQ_HZ),
         .C_SDLC_CLK_HZ        (C_SDLC_CLK_HZ),
         .C_RESET_PULSE_US     (C_RESET_PULSE_US),
+        .C_ACTIVATION_GRACE_US(300),   // scaled from 1 s for simulation
+        .C_BIT_GRACE_US       (200),   // scaled from 0.3 s for simulation
         .C_DEFAULT_CLK_EN     (1),
         .C_DEFAULT_MSG1_ONLY  (0),
         .C_DEFAULT_MSG2_ONLY  (0),
@@ -215,6 +220,20 @@ module tb_sm5800_imu_axi;
             irq_at_bvalid_r = irq_o;
         end
         bvalid_d1_r = s_axi_bvalid;
+    end
+
+    // (a2) Count rising edges of irq_o (what an edge-triggered GIC sees)
+    integer     irq_rise_cnt;
+    reg         irq_d1_r;
+    initial begin
+        irq_rise_cnt = 0;
+        irq_d1_r     = 1'b0;
+    end
+    always @(posedge s_axi_aclk) begin
+        if (irq_o && !irq_d1_r) begin
+            irq_rise_cnt = irq_rise_cnt + 1;
+        end
+        irq_d1_r = irq_o;
     end
 
     // (b) RESET_BUSY must already be 1 in the cycle the pulse is requested
@@ -910,7 +929,7 @@ module tb_sm5800_imu_axi;
         axi_write(ADDR_INT_STATUS,  32'h0000_007F, 4'hF, 2'd0);
 
         // 15a. Sensor alive (flags) but NEVER sends data after reset -> must time out
-        u_sensor.send_idle_flags(25); // 200 us > 150 us
+        u_sensor.send_idle_flags(70); // 560 us > 150 us timeout + 300 us start-up grace
         wait_rx_settle();
         axi_read(ADDR_STATUS, rd_val);
         check_eq(rd_val & 32'h0000_0003, 32'h0000_0001, "T15a FLAGS_ALIVE=1, DATA_ACTIVE=0");
@@ -1047,7 +1066,7 @@ module tb_sm5800_imu_axi;
         axi_read(ADDR_INT_STATUS, rd_val);
         check_eq(rd_val & 32'h0000_0020, 32'h0000_0000, "T16e no LINK_TIMEOUT while Commanded BIT active");
         axi_write(ADDR_CTRL,       32'h0000_0001, 4'hF, 2'd0); // release BIT_L
-        u_sensor.send_idle_flags(25);                           // still silent
+        u_sensor.send_idle_flags(50);                           // 400 us > 150 + 200 us BIT grace
         wait_rx_settle();
         axi_read(ADDR_INT_STATUS, rd_val);
         check_eq(rd_val & 32'h0000_0020, 32'h0000_0020, "T16e LINK_TIMEOUT re-armed after BIT_L release");
@@ -1056,6 +1075,133 @@ module tb_sm5800_imu_axi;
 
         // 16f. 33.333 MHz clock controller: 1 us tick = 34 cycles (>= 1.000 us)
         check_eq(frac_tick_period, 32'd34, "T16f 1 us tick rounds up on 33.333 MHz clock");
+
+        //----------------------------------------------------------------------
+        // [T17] Edge-triggered GIC safety: every W1C write re-arms irq_o, so an
+        //       enabled flag left pending produces a NEW rising edge
+        //----------------------------------------------------------------------
+        $display("[T17] Testing irq_o re-arm (new rising edge) after partial W1C...");
+        axi_write(ADDR_CTRL,        32'h0000_0001, 4'hF, 2'd0); // normal mode
+        axi_write(ADDR_INT_ENABLE,  32'h0000_007F, 4'hF, 2'd0); // all sources
+        axi_write(ADDR_INT_STATUS,  32'h0000_007F, 4'hF, 2'd0);
+        u_sensor.send_msg1(
+            8'h0A,
+            16'h1717, 16'h1717, 16'h1717,
+            16'h1717, 16'h1717, 16'h1717,
+            16'h1906, 16'h0003,
+            1'b1, 1'b0, 1'b0
+        );
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0041, 32'h0000_0041, "T17 MSG1_READY and MC_ANY pending");
+        check_eq({31'd0, irq_o}, 32'd1, "T17 irq_o high before partial W1C");
+        t17_rise_base = irq_rise_cnt;
+
+        // Clear MSG1_READY only: MC_ANY (enabled) stays pending
+        axi_write(ADDR_INT_STATUS, 32'h0000_0001, 4'hF, 2'd0);
+        repeat (3) @(posedge s_axi_aclk);
+        check_eq({31'd0, irq_at_bvalid_r}, 32'd0, "T17 irq_o dropped in the W1C cycle");
+        check_eq({31'd0, irq_o}, 32'd1, "T17 irq_o high again (MC_ANY still pending)");
+        check_eq(irq_rise_cnt - t17_rise_base, 32'd1, "T17 exactly one NEW rising edge after partial W1C");
+
+        // Full clear: irq_o low, no further edge
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+        repeat (3) @(posedge s_axi_aclk);
+        check_eq({31'd0, irq_o}, 32'd0, "T17 irq_o low after full W1C");
+        check_eq(irq_rise_cnt - t17_rise_base, 32'd1, "T17 no spurious edge after full W1C");
+
+        //----------------------------------------------------------------------
+        // [T18] Datasheet timing: watchdog grace after start-up / RESET_L (0.8 s
+        //       activation, Sec. 5.1 & 6.4) and after Commanded BIT (Sec. 6.3.2).
+        //       Simulation scale: timeout 150 us, start-up grace 300 us, BIT 200 us
+        //----------------------------------------------------------------------
+        $display("[T18] Testing watchdog grace after start-up, RESET_L and BIT...");
+        axi_write(ADDR_TIMEOUT_CFG, 32'd150,       4'hF, 2'd0);
+        axi_write(ADDR_INT_ENABLE,  32'h0000_007F, 4'hF, 2'd0);
+
+        // 18a. Soft reset: sensor still in power-up BIT (flags only)
+        axi_write(ADDR_CTRL,        32'h0000_0201, 4'hF, 2'd0); // CLK_EN + SOFT_RESET
+        axi_write(ADDR_INT_STATUS,  32'h0000_007F, 4'hF, 2'd0);
+        u_sensor.send_idle_flags(50);                            // 400 us < 450 us
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0000, "T18a no LINK_TIMEOUT inside start-up grace");
+        u_sensor.send_idle_flags(25);                            // now > 450 us
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0020, "T18a LINK_TIMEOUT after start-up grace expires");
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+
+        // 18b. RESET_L pulse: after release the sensor restarts -> start-up grace
+        u_sensor.send_msg1(
+            8'h0A,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1901, 16'h0003,
+            1'b1, 1'b0, 1'b0
+        );
+        wait_rx_settle();
+        axi_write(ADDR_CTRL, 32'h0000_0009, 4'hF, 2'd0);        // CLK_EN + RESET_PULSE
+        @(posedge imu_reset_l_o);                                // RESET_L released
+        axi_read(ADDR_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0000, "T18b RESET_L pulse finished");
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+        u_sensor.send_idle_flags(50);                            // 400 us: < 450, > 350
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0000, "T18b no LINK_TIMEOUT inside post-RESET_L grace");
+        u_sensor.send_idle_flags(25);
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0020, "T18b LINK_TIMEOUT after post-RESET_L grace");
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+
+        // 18c. Commanded BIT: after BIT_L release the shorter BIT grace applies
+        u_sensor.send_msg1(
+            8'h0A,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1902, 16'h0003,
+            1'b1, 1'b0, 1'b0
+        );
+        wait_rx_settle();
+        axi_write(ADDR_CTRL, 32'h0000_0005, 4'hF, 2'd0);        // CMD_BIT_EN
+        u_sensor.send_idle_flags(10);
+        axi_write(ADDR_CTRL, 32'h0000_0001, 4'hF, 2'd0);        // release BIT_L
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+        u_sensor.send_idle_flags(37);                            // ~300 us < 350 us
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0000, "T18c no LINK_TIMEOUT inside post-BIT grace");
+        u_sensor.send_idle_flags(25);
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0020, "T18c LINK_TIMEOUT after post-BIT grace");
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+
+        // 18d. The first valid frame ends the grace: normal 150 us timeout again
+        axi_write(ADDR_CTRL,       32'h0000_0201, 4'hF, 2'd0);  // soft reset -> grace
+        u_sensor.send_msg1(
+            8'h0A,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1818, 16'h1818, 16'h1818,
+            16'h1903, 16'h0003,
+            1'b1, 1'b0, 1'b0
+        );
+        wait_rx_settle();
+        axi_write(ADDR_INT_STATUS, 32'h0000_007F, 4'hF, 2'd0);
+        u_sensor.send_idle_flags(25);                            // 200 us > 150 us
+        wait_rx_settle();
+        axi_read(ADDR_INT_STATUS, rd_val);
+        check_eq(rd_val & 32'h0000_0020, 32'h0000_0020, "T18d valid frame ends grace (150 us timeout)");
+        axi_write(ADDR_INT_STATUS,  32'h0000_007F, 4'hF, 2'd0);
+        axi_write(ADDR_TIMEOUT_CFG, 32'd30000,     4'hF, 2'd0);
+
+        // 18e. Default parameters cover the datasheet times (0.8 s, 0.1 + 0.2 s)
+        check_eq({31'd0, (u_dut_dflt.u_msg_parser.C_ACTIVATION_GRACE_US >= 800000)}, 32'd1,
+                 "T18e default start-up grace >= 0.8 s");
+        check_eq({31'd0, (u_dut_dflt.u_msg_parser.C_BIT_GRACE_US >= 300000)}, 32'd1,
+                 "T18e default BIT grace >= 0.3 s");
 
         //----------------------------------------------------------------------
         // Final Summary

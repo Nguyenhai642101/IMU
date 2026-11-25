@@ -19,9 +19,9 @@
 | 3. Kiểm tra tĩnh C Rules (MISRA C:2012 + BARR-C + DO-178C) | Automated Static Audit | 6 tệp | 6 | 0 | 0 | **PASS** |
 | 4. Kiểm chứng hệ số quy đổi vật lý 100 Hz (`sm5800_raw_to_eng_msg2`) | Analytical / Vector Check | 5 | 5 | 0 | 0 | **PASS** (vector `Delta Velocity Z` đã được sửa — bản gốc ghi PASS nhưng sai 10 lần) |
 | 5. Kiểm tra truy vết hai chiều (`HLR ↔ LLR ↔ SDD ↔ Code`) | Automated Tag Audit | 66 LLR (12 RTL + 54 C) | 66 | 0 | 0 | **PASS** |
-| 6. Mô phỏng RTL Testbench (`tb/tb_sm5800_imu_axi.v`, `[T1]`–`[T16]`) | Icarus Verilog `iverilog -g2001` | 16 (255 assertion) | 16 | 0 | 0 | **PASS** (`[T16]` bảo vệ 6 thay đổi của commit `52031fa`: đảo ngược bất kỳ thay đổi nào đều làm `[T16]` FAIL; sau khi sửa lỗi khung cụt/runt frame; bản gốc: 4 lỗi ở T3/T4/T7) |
+| 6. Mô phỏng RTL Testbench (`tb/tb_sm5800_imu_axi.v`, `[T1]`–`[T18]`) | Icarus Verilog `iverilog -g2001` | 18 (302 assertion) | 18 | 0 | 0 | **PASS** (`[T16]` bảo vệ 6 thay đổi của commit `52031fa`: đảo ngược bất kỳ thay đổi nào đều làm `[T16]` FAIL; sau khi sửa lỗi khung cụt/runt frame; bản gốc: 4 lỗi ở T3/T4/T7) |
 | 7. Biên dịch chéo ARM GCC §12 & phân tích WCSU (`.su`) | `arm-none-eabi-gcc 13.2.1`, `-mcpu=cortex-a9` | 3 tệp `.c` | 3 | 0 | 0 | **PASS** (0 warning; stack lớn nhất 128 B ≤ 256 B; ISR `sm5800_irq_isr`: 0 lệnh VFP/NEON, 0 vòng lặp, `dsb` sau W1C, `dmb` trước khi thoát) |
-| 8. Unit Test C (`TC-DRV-01`–`TC-DRV-17`, `TC-APP-01`–`02`) | Host GCC 13 + Mock HAL | 19 (92 + 9 assertion) | 19 | 0 | 0 | **PASS** trên host (bản gốc: `TC-DRV-08` lỗi do vector sai 10 lần; commit `52031fa`: `TC-DRV-17` lỗi do test không đọc mẫu Msg 02 trước kịch bản timeout — đã sửa). Độ phủ MC/DC: chưa đo |
+| 8. Unit Test C (`TC-DRV-01`–`TC-DRV-17`, `TC-APP-01`–`03`) | Host GCC 13 + Mock HAL | 20 (92 + 16 assertion) | 20 | 0 | 0 | **PASS** trên host (bản gốc: `TC-DRV-08` lỗi do vector sai 10 lần; commit `52031fa`: `TC-DRV-17` lỗi do test không đọc mẫu Msg 02 trước kịch bản timeout — đã sửa). Độ phủ MC/DC: chưa đo |
 | 9. Kiểm thử phần cứng HIL với cảm biến SM-5800 vật lý | Zynq PS/PL + SM-5800 | 4 | 0 | 0 | 4 | **PENDING_TARGET_EXEC** |
 
 > **Ghi chú minh bạch:** Môi trường sinh mã hiện tại không cài sẵn `iverilog`/`xsim`/`arm-none-eabi-gcc` và chưa kết nối phần cứng SM-5800 thật. Các mục 1–5 đã được thực thi và kiểm chứng trực tiếp đạt `PASS` (0 lỗi); các mục 6–9 đã có đủ kịch bản, testbench và lệnh thực thi để team chạy ký duyệt trên máy phát triển EDA/phòng lab.
@@ -114,6 +114,8 @@ iverilog -g2001 -Wall -o sim_sm5800.vvp \
 | `[T14]` | `RTL-009` | Khung cụt / nhiễu kẹt mức thấp giữa các cờ (`< 32 bit`, ISO 3309) | Bỏ qua im lặng khung `< 32 bit`, bắt lỗi khung `≥ 32 bit`, không lệch counter | **PASS** |
 | `[T15]` | `RTL-009` | Watchdog khi cảm biến im lặng từ lúc khởi động, one-shot IRQ, tự re-arm và mặc định an toàn 100 Hz | Báo `LINK_TIMEOUT` một lần, tự kích hoạt lại sau khung hợp lệ, `TIMEOUT_CFG >= 12 ms` | **PASS** |
 | `[T16]` | `RTL-001`, `002`, `009`, `012` | PL→PS: `irq_o` tắt cùng chu kỳ `BVALID` khi W1C `INT_STATUS` / ghi `INT_ENABLE = 0`; `RESET_BUSY = 1` ngay chu kỳ yêu cầu xung; `MSG2_ONLY`: lỗi BIT trong Msg 01 (không commit) không bật `IMU_FAULT`, Msg 02 thì bật; `LAST_SEQ` theo mọi khung hợp lệ; watchdog hết hạn im lặng khi đang Commanded BIT rồi tự kích hoạt lại khi nhả `BIT_L`; tick 1 µs làm tròn lên (34 chu kỳ ở 33,333 MHz) | 0 lỗi; mỗi thay đổi của `52031fa` khi bị đảo ngược đều bị một kiểm tra `[T16]` bắt | **PASS** |
+| `[T17]` | `RTL-012` | Xóa W1C **một phần** (`MSG1_READY`) trong khi `MC_ANY` (được cho phép) vẫn treo | `irq_o` xuống 0 đúng chu kỳ W1C, lên lại và tạo **đúng 1 cạnh lên mới**; xóa hết thì `irq_o = 0`, không có cạnh giả. Trên RTL cũ: 0 cạnh mới (GIC kích cạnh sẽ kẹt) | **PASS** |
+| `[T18]` | `RTL-009` | Khoảng ân hạn watchdog theo datasheet (mô phỏng thu nhỏ: timeout 150 µs, khởi động 300 µs, BIT 200 µs): sau soft-reset, sau nhả `RESET_L`, sau nhả `BIT_L`; khung hợp lệ kết thúc ân hạn; tham số mặc định ≥ 0.8 s / ≥ 0.3 s | Không có `LINK_TIMEOUT` trong ân hạn, có ngay sau ân hạn; mỗi biến thể lỗi (không ân hạn, khung không xóa ân hạn, reset dùng ân hạn BIT, BIT không ân hạn) đều bị bắt | **PASS** |
 
 ### 3.2 Bộ kiểm thử Đơn vị & Phủ cấu trúc MC/DC cho Driver C (`driver/`)
 
@@ -148,6 +150,7 @@ arm-none-eabi-gcc -std=c99 -pedantic-errors -O1 -fno-inline \
 | `TC-DRV-17` | `DRV-028`, `APP-008` | `sm5800_take_irq_faults()` với `NULL`, `UNINIT`, ngắt 100 Hz bình thường (`0x43`, sau đó ứng dụng đọc mẫu ra) và ngắt lỗi `LINK_TIMEOUT` / `IMU_FAULT` | Lọc bỏ bit `MSG1`/`MC_ANY` bình thường; `LINK_TIMEOUT` không tạo mẫu Msg 02 giả; chốt & xóa đúng cờ lỗi trong vùng găng | **PASS** |
 | `TC-APP-01` | `APP-006` | `verify_raw_to_eng_math()` của chương trình mẫu chạy trên host (`tests/test_ps_example.c`) | Tự kiểm tra 1 rad/s, 1 g, 1 mrad, 0,0981 m/s, 25 °C, phiên bản 3 → `SM5800_OK` | **PASS** |
 | `TC-APP-02` | `APP-005` | Kiểm tra tốc độ quay hợp lệ: mẫu bình thường; 18,4 rad/s cả 3 trục (biên trong); +Z / −Y / −X = ±18,75 rad/s (bão hòa) | Mẫu biên trong được nhận; mẫu bão hòa trả `ERR_NO_SAMPLE`, không ghi đè mẫu tốt, đếm đúng 3 lần loại | **PASS** |
+| `TC-APP-03` | `APP-002` | Đường ngắt của chương trình mẫu khi không có Xilinx BSP: `init_imu_100hz()` chọn chế độ polling; `INT_STATUS = 0` → không có mẫu; `MSG2_READY` → `service_irq_polling()` chạy ISR, xóa W1C, mẫu 1 g đọc được; `deinit` sạch | Mẫu Msg 02 được giao qua polling, không cần GIC | **PASS** |
 
 ### 3.3 Kiểm thử Phần cứng vòng kín (HIL) với SM-5800 thật
 

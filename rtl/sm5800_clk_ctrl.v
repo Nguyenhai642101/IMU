@@ -67,8 +67,9 @@ module sm5800_clk_ctrl #(
 
     //--------------------------------------------------------------------------
     // Elaboration-time parameter guards (Verilog-2001 has no $error): an
-    // illegal configuration instantiates a non-existent module whose name
-    // states the problem, so synthesis / simulation stops immediately.
+    // illegal configuration connects a non-existent port of the empty module
+    // sm5800_param_error; the port name states the problem, so synthesis /
+    // simulation stops immediately (see rtl/sm5800_param_error.v).
     //   1. RCV_CLK must be within +/-2 % of C_SDLC_CLK_HZ and 50 % +/-2 % duty
     //      (SM-5800 Table 5): error = r / (P * f_target) <= 1/50, and P even
     //      or P >= 25.
@@ -78,15 +79,21 @@ module sm5800_clk_ctrl #(
     generate
         if ((P_CLK_PERIOD_INT < 2) || (P_CLK_PERIOD_INT > 65535) ||
             (P_US_PERIOD_INT < 1) || (P_US_PERIOD_INT > 65535)) begin : g_err_div
-            SM5800_PARAM_ERROR_CLK_DIVIDER_OUT_OF_16BIT_RANGE u_param_error ();
+            /* verilator lint_off PINNOTFOUND */
+            sm5800_param_error u_param_error (.SM5800_PARAM_ERROR_CLK_DIVIDER_OUT_OF_16BIT_RANGE(1'b0));
+            /* verilator lint_on PINNOTFOUND */
         end
         if (((50 * (C_CLK_FREQ_HZ % C_SDLC_CLK_HZ)) >
              (P_CLK_PERIOD_INT * C_SDLC_CLK_HZ)) ||
             (((P_CLK_PERIOD_INT % 2) != 0) && (P_CLK_PERIOD_INT < 25))) begin : g_err_freq
-            SM5800_PARAM_ERROR_RCV_CLK_OUTSIDE_2PCT_TOLERANCE u_param_error ();
+            /* verilator lint_off PINNOTFOUND */
+            sm5800_param_error u_param_error (.SM5800_PARAM_ERROR_RCV_CLK_OUTSIDE_2PCT_TOLERANCE(1'b0));
+            /* verilator lint_on PINNOTFOUND */
         end
         if ((C_RESET_PULSE_US <= 1000) || (C_RESET_PULSE_US >= 65535)) begin : g_err_rst
-            SM5800_PARAM_ERROR_RESET_PULSE_US_NOT_IN_1001_TO_65534 u_param_error ();
+            /* verilator lint_off PINNOTFOUND */
+            sm5800_param_error u_param_error (.SM5800_PARAM_ERROR_RESET_PULSE_US_NOT_IN_1001_TO_65534(1'b0));
+            /* verilator lint_on PINNOTFOUND */
         end
     endgenerate
 

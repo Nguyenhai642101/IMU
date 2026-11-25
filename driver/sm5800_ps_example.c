@@ -10,13 +10,61 @@
 #include <stdint.h>
 
 #include "sm5800_drv.h"
+#include "sm5800_hal.h"
 #include "sm5800_regs.h"
 
-/* Example AXI4-Lite peripheral base address from Vivado Address Editor */
+/* Xilinx standalone BSP (Vitis) present -> real GIC interrupts.
+ * Without it (host unit tests, bare cross builds) the main loop polls
+ * INT_STATUS instead. Define APP_FORCE_IRQ_POLLING to poll even with the
+ * BSP: useful to tell a PL->PS IRQ wiring / IRQ ID problem from an IP or
+ * sensor problem (polling works but interrupts do not -> wiring / ID). */
+#if defined(__has_include)
+#if __has_include("xscugic.h")
+#define APP_HAVE_XSCUGIC
+#endif
+#endif
+
+#if defined(APP_HAVE_XSCUGIC) && !defined(APP_FORCE_IRQ_POLLING)
+#define APP_USE_GIC
+#include "xparameters.h"
+#include "xscugic.h"
+#include "xil_exception.h"
+#endif
+
+/* GIC interrupt ID (SPI) of the IP's irq_o. Prefer the value from
+ * xparameters.h (XPAR_FABRIC_<ip>_IRQ_O_INTR) or Vivado, e.g. build with
+ * -DIMU_IRQ_ID=XPAR_FABRIC_SM5800_IMU_AXI_TOP_0_IRQ_O_INTR. Defaults:
+ *  - Zynq-7000 IRQ_F2P[0]        = 61  (IRQ_F2P[1..7] = 62..68)
+ *  - ZynqMP pl_ps_irq0[0], APU   = 121 (pl_ps_irq0[1..7] = 122..128)
+ *  - ZynqMP RPU (Cortex-R5) also uses 121: define IMU_IRQ_ID=121U */
+#ifndef IMU_IRQ_ID
+#if defined(__aarch64__)
+#define IMU_IRQ_ID              (121U)
+#else
+#define IMU_IRQ_ID              (61U)
+#endif
+#endif
+
+/* GIC trigger for irq_o: 0x03 = rising edge (default, verified on hardware),
+ * 0x01 = active-high level. Both work: the IP drops irq_o for one cycle on
+ * every INT_STATUS W1C write, so a flag still pending makes a new edge. */
+#define APP_GIC_PRIORITY        (0xA0U)
+#ifndef APP_GIC_TRIGGER
+#define APP_GIC_TRIGGER         (0x03U)
+#endif
+
+/* AXI4-Lite base address of the SM-5800 IP (Vivado Address Editor).
+ * Default: Zynq-7000 M_AXI_GP0 (0x43C00000). Zynq UltraScale+ maps the PL
+ * at 0xA0000000 (M_AXI_HPM0_FPD) by default: build with
+ * -DIMU_AXI_BASE_ADDR=<XPAR_..._BASEADDR from xparameters.h>. */
+#ifndef IMU_AXI_BASE_ADDR
 #define IMU_AXI_BASE_ADDR       ((uintptr_t)0x43C00000U)
+#endif
 
 /* Bounded iteration limits for example acquisition and BIT dwell */
-#define APP_MAX_POLL_CYCLES     (1000000U)
+/* Upper bound only: the loop normally ends after APP_TARGET_SAMPLES
+ * (1 s at 100 Hz). 1e6 polls took well under 1 s on a GHz core. */
+#define APP_MAX_POLL_CYCLES     (400000000U)
 #define APP_TARGET_SAMPLES      (100U)
 #define APP_CMD_BIT_DWELL_TICKS (200000U)
 
@@ -116,6 +164,11 @@ static sm5800_status_t handle_msg2_and_faults(
     sm5800_msg2_eng_t const * p_eng);
 static sm5800_status_t run_commanded_bit_cycle(void);
 static sm5800_status_t handle_link_faults(void);
+static sm5800_status_t init_irq_path(void);
+static void service_irq_polling(void);
+#if defined(APP_USE_GIC)
+static void kick_isr_once(void);
+#endif
 static bool is_rate_plausible(sm5800_msg2_eng_t const * p_eng);
 
 /**
@@ -132,6 +185,48 @@ void sm5800_ps_gic_isr(void)
 {
     sm5800_irq_isr(&g_imu_drv);
 }
+
+
+/**
+ * @brief   true: no GIC connection, main loop polls INT_STATUS instead.
+ * @req     LLR-SM5800-APP-002
+ * @design  SDD-SM5800-4.1
+ */
+static bool g_irq_polling = true;
+
+#if defined(APP_USE_GIC)
+/**
+ * @brief   Xilinx SCU GIC driver instance used by the example.
+ * @req     LLR-SM5800-APP-002
+ * @design  SDD-SM5800-4.1
+ */
+static XScuGic g_gic;
+
+
+/**
+ * @brief       CPU IRQ exception entry: dispatch to the GIC driver.
+ * @req         LLR-SM5800-APP-002
+ * @design      SDD-SM5800-4.1
+ * @param[in]   p_ctx  &g_gic, registered with Xil_ExceptionRegisterHandler.
+ */
+static void gic_irq_dispatch(void * p_ctx)
+{
+    XScuGic_InterruptHandler((XScuGic *)p_ctx);
+}
+
+
+/**
+ * @brief       GIC handler for the IP's irq_o: runs the driver ISR.
+ * @req         LLR-SM5800-APP-002
+ * @design      SDD-SM5800-4.1
+ * @param[in]   p_ctx  Unused callback reference (NULL).
+ */
+static void imu_gic_handler(void * p_ctx)
+{
+    (void)p_ctx;
+    sm5800_ps_gic_isr();
+}
+#endif
 
 
 /**
@@ -165,13 +260,12 @@ int main(void)
         uint32_t poll_cycles = 0U;
         bool is_running = true;
 
-        /* Note: Connect sm5800_ps_gic_isr to the GIC IRQ ID of FPGA irq_o
-         * via vendor BSP (e.g. XScuGic_Connect) before entering this loop. */
         while ((sample_count < APP_TARGET_SAMPLES)
                && (poll_cycles < APP_MAX_POLL_CYCLES)
                && is_running)
         {
             poll_cycles++;
+            service_irq_polling();
             status = handle_link_faults();
 
             if (SM5800_OK != status)
@@ -273,6 +367,16 @@ static sm5800_status_t init_imu_100hz(void)
     else
     {
         /* CRC calculation failed; propagate status */
+    }
+
+    if (SM5800_OK == result)
+    {
+        /* Driver is READY (ISR active) before the GIC can deliver irq_o */
+        result = init_irq_path();
+    }
+    else
+    {
+        /* CRC or driver initialization failed; propagate status */
     }
 
     return result;
@@ -547,3 +651,106 @@ static bool is_rate_plausible(sm5800_msg2_eng_t const * p_eng)
 
     return is_ok;
 }
+
+
+/**
+ * @brief       Route the IP's irq_o through the GIC to sm5800_ps_gic_isr().
+ * @req         LLR-SM5800-APP-002
+ * @design      SDD-SM5800-4.1
+ * @return      SM5800_OK, or SM5800_ERR_STATE if the GIC cannot be set up.
+ * @note        Not ISR-safe. Call after sm5800_init(). Without the Xilinx
+ *              BSP (or with APP_FORCE_IRQ_POLLING) selects polling mode.
+ */
+static sm5800_status_t init_irq_path(void)
+{
+    sm5800_status_t result = SM5800_OK;
+
+#if defined(APP_USE_GIC)
+    XScuGic_Config * p_gic_cfg = NULL;
+
+#if defined(SDT)
+    p_gic_cfg = XScuGic_LookupConfig(XPAR_XSCUGIC_0_BASEADDR);
+#else
+    p_gic_cfg = XScuGic_LookupConfig(XPAR_SCUGIC_0_DEVICE_ID);
+#endif
+
+    if (NULL == p_gic_cfg)
+    {
+        result = SM5800_ERR_STATE;
+    }
+    else if (XST_SUCCESS != XScuGic_CfgInitialize(&g_gic, p_gic_cfg,
+                 (u32)p_gic_cfg->CpuBaseAddress))
+    {
+        result = SM5800_ERR_STATE;
+    }
+    else
+    {
+        XScuGic_SetPriorityTriggerType(&g_gic, IMU_IRQ_ID,
+                                       (u8)APP_GIC_PRIORITY,
+                                       (u8)APP_GIC_TRIGGER);
+        Xil_ExceptionInit();
+        Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
+                                     gic_irq_dispatch, &g_gic);
+
+        if (XST_SUCCESS != XScuGic_Connect(&g_gic, IMU_IRQ_ID,
+                                           imu_gic_handler, NULL))
+        {
+            result = SM5800_ERR_STATE;
+        }
+        else
+        {
+            XScuGic_Enable(&g_gic, IMU_IRQ_ID);
+            /* Unmask CPU IRQs (same as Xil_ExceptionEnable(): cpsie i /
+             * msr daifclr,#2) via the HAL; the Xilinx macro does not
+             * build warning-free under the section-12 flags on ARMv7. */
+            sm5800_hal_exit_crit(0U);
+            g_irq_polling = false;
+            kick_isr_once();
+        }
+    }
+#else
+    /* No GIC driver available (or polling forced): poll from main loop */
+    g_irq_polling = true;
+#endif
+
+    return result;
+}
+
+
+/**
+ * @brief       Polling mode only: run the driver ISR from the main loop.
+ * @req         LLR-SM5800-APP-002
+ * @design      SDD-SM5800-4.1
+ * @note        Not ISR-safe. No-op when the GIC delivers interrupts.
+ */
+static void service_irq_polling(void)
+{
+    if (g_irq_polling)
+    {
+        sm5800_irq_isr(&g_imu_drv);
+    }
+    else
+    {
+        /* Interrupt mode: sm5800_ps_gic_isr() runs from the GIC */
+    }
+}
+
+
+#if defined(APP_USE_GIC)
+/**
+ * @brief       Run the driver ISR once from task context, IRQs masked.
+ * @req         LLR-SM5800-APP-002
+ * @design      SDD-SM5800-4.1
+ * @note        Not ISR-safe. A flag raised after sm5800_init() armed
+ *              INT_ENABLE but before the GIC was configured left irq_o high
+ *              without an edge the GIC saw; handling it here (W1C) re-arms
+ *              irq_o so every later event produces a fresh rising edge.
+ */
+static void kick_isr_once(void)
+{
+    uint32_t saved_mask = sm5800_hal_enter_crit();
+
+    sm5800_irq_isr(&g_imu_drv);
+    sm5800_hal_exit_crit(saved_mask);
+}
+#endif

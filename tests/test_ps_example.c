@@ -1,6 +1,6 @@
 /**
  * @file    test_ps_example.c
- * @brief   Host C99 unit tests for the PS example application (TC-APP-01..02).
+ * @brief   Host C99 unit tests for the PS example application (TC-APP-01..03).
  * @note    The example's helpers are file-static, so this test includes the
  *          example source directly (its main() is renamed by the Makefile
  *          with -Dmain=app_example_main) and runs against the Mock HAL.
@@ -9,6 +9,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+
+#include "mock_sm5800_hal.h"
 
 int app_example_main(void);
 
@@ -107,12 +109,46 @@ static void test_rate_plausibility(void)
 }
 
 
+static void test_irq_path_polling(void)
+{
+    sm5800_msg2_eng_t eng = { .timestamp_us = 0U };
+
+    /* TC-APP-03: without the Xilinx BSP the example must still deliver
+     * Msg 02 samples by polling INT_STATUS from the main loop */
+    mock_hal_reset();
+    g_irq_polling = false;
+    app_check(SM5800_OK == init_imu_100hz(),
+              "TC-APP-03: init_imu_100hz() == OK (driver + IRQ path)");
+    app_check(g_irq_polling,
+              "TC-APP-03: no GIC driver -> polling mode selected");
+
+    service_irq_polling();
+    app_check(!sm5800_is_msg2_pending(&g_imu_drv),
+              "TC-APP-03: no sample pending while INT_STATUS == 0");
+
+    mock_hal_set_reg(SM5800_REG_LIN_ACC_Z, 879U);
+    mock_hal_set_reg(SM5800_REG_STATUS_WORD1, 0x1901U);
+    mock_hal_set_reg(SM5800_REG_INT_STATUS, SM5800_INT_MSG2_RDY_MASK);
+    service_irq_polling();
+    app_check(sm5800_is_msg2_pending(&g_imu_drv),
+              "TC-APP-03: polled MSG2_READY sets the pending flag");
+    app_check(0U == mock_hal_get_reg(SM5800_REG_INT_STATUS),
+              "TC-APP-03: polled ISR acknowledged INT_STATUS (W1C)");
+    app_check((SM5800_OK == sm5800_read_msg2_eng(&g_imu_drv, &eng))
+              && (eng.accel_z_m_s2 > 9.7f) && (eng.accel_z_m_s2 < 9.9f),
+              "TC-APP-03: polled sample read and converted (1 g)");
+    app_check(SM5800_OK == sm5800_deinit(&g_imu_drv),
+              "TC-APP-03: clean deinit");
+}
+
+
 int main(void)
 {
     int exit_code = 0;
 
     test_self_check();
     test_rate_plausibility();
+    test_irq_path_polling();
 
     (void)printf("==================================================\n");
     (void)printf("SM-5800 PS Example Unit Tests: %u passed, %u failed\n",

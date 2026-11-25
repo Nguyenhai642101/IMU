@@ -3,7 +3,8 @@
 #==============================================================================
 
 BUILD_DIR   := build
-RTL_SRCS    := rtl/sm5800_crc16_ccitt.v \
+RTL_SRCS    := rtl/sm5800_param_error.v \
+               rtl/sm5800_crc16_ccitt.v \
                rtl/sm5800_clk_ctrl.v \
                rtl/sm5800_sdlc_rx.v \
                rtl/sm5800_msg_parser.v \
@@ -15,6 +16,10 @@ TB_SRCS     := tb/sm5800_sensor_model.v \
 HOST_CC     ?= gcc
 ARM_CC      ?= arm-none-eabi-gcc
 ARM_OBJDUMP ?= arm-none-eabi-objdump
+# AArch64 (Zynq UltraScale+ Cortex-A53): Vitis ships aarch64-none-elf-gcc;
+# a distro cross compiler (aarch64-linux-gnu-gcc) is used if that is absent.
+A64_CC      ?= $(shell command -v aarch64-none-elf-gcc >/dev/null 2>&1 && echo aarch64-none-elf-gcc || echo aarch64-linux-gnu-gcc)
+A64_OBJDUMP ?= $(patsubst %gcc,%objdump,$(A64_CC))
 IVERILOG    ?= iverilog
 VVP         ?= vvp
 VERILATOR   ?= verilator
@@ -33,7 +38,7 @@ TEST_CFLAGS   := -std=c99 -pedantic-errors -O1 -fno-inline \
                  -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wundef \
                  -Wcast-qual -Wvla -fno-common -Idriver -Itests
 
-.PHONY: all sim xsim lint-rtl check-guards test-c build-arm verify-static clean
+.PHONY: all sim xsim lint-rtl check-guards test-c build-arm build-arm64 verify-static clean
 
 all: verify-static sim check-guards test-c
 
@@ -44,12 +49,12 @@ $(BUILD_DIR):
 verify-static:
 	$(PWSH) -NoProfile -ExecutionPolicy Bypass -File scripts/verify_project.ps1
 
-# Gate 2a: RTL simulation via Icarus Verilog ([T1]-[T16])
+# Gate 2a: RTL simulation via Icarus Verilog ([T1]-[T18])
 sim: $(BUILD_DIR)
-	$(IVERILOG) -g2001 -Wall -o $(BUILD_DIR)/sim_sm5800.vvp $(RTL_SRCS) $(TB_SRCS)
+	$(IVERILOG) -g2001 -Wall -s tb_sm5800_imu_axi -o $(BUILD_DIR)/sim_sm5800.vvp $(RTL_SRCS) $(TB_SRCS)
 	$(VVP) $(BUILD_DIR)/sim_sm5800.vvp
 
-# Gate 2b: RTL simulation via Xilinx Vivado xsim ([T1]-[T16])
+# Gate 2b: RTL simulation via Xilinx Vivado xsim ([T1]-[T18])
 xsim:
 	xvlog $(RTL_SRCS) $(TB_SRCS)
 	xelab -debug typical tb_sm5800_imu_axi -s sim_sm5800
@@ -60,7 +65,8 @@ lint-rtl:
 	$(VERILATOR) --lint-only -Wall --top-module sm5800_imu_axi_top $(RTL_SRCS)
 
 # Gate 2d: Elaboration-time parameter guards. Each illegal configuration must
-# FAIL with the named SM5800_PARAM_ERROR_*; each legal one must elaborate.
+# FAIL with the named SM5800_PARAM_ERROR_* (a deliberately missing port of
+# rtl/sm5800_param_error.v); each legal one must elaborate.
 GUARD_TOP := -s sm5800_imu_axi_top
 GUARD_P   := -Psm5800_imu_axi_top.
 define guard_must_fail
@@ -100,12 +106,23 @@ test-c: $(BUILD_DIR)
 	./$(BUILD_DIR)/test_ps_example
 
 # Gate 4: Cross-compile ARM Cortex-A9 PS Driver + emit .su stack usage + check ISR asm
+# (also compiles the HAL for Cortex-R5 / ZynqMP RPU, same ARMv7 code path)
 build-arm: $(BUILD_DIR)
+	$(ARM_CC) -mcpu=cortex-r5 $(STRICT_CFLAGS) -c driver/sm5800_hal.c -o $(BUILD_DIR)/sm5800_hal_r5.o
 	$(ARM_CC) -mcpu=cortex-a9 $(STRICT_CFLAGS) -c driver/sm5800_hal.c -o $(BUILD_DIR)/sm5800_hal.o
 	$(ARM_CC) -mcpu=cortex-a9 $(STRICT_CFLAGS) -c driver/sm5800_drv.c -o $(BUILD_DIR)/sm5800_drv.o
 	$(ARM_CC) -mcpu=cortex-a9 $(STRICT_CFLAGS) -c driver/sm5800_ps_example.c -o $(BUILD_DIR)/sm5800_ps_example.o
 	$(ARM_OBJDUMP) -d $(BUILD_DIR)/sm5800_drv.o > $(BUILD_DIR)/sm5800_drv.dis
 	@echo "Stack usage files (.su) generated in $(BUILD_DIR)/"
+
+# Gate 4b: Cross-compile for Zynq UltraScale+ APU (Cortex-A53, AArch64)
+build-arm64: $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/a53
+	$(A64_CC) -mcpu=cortex-a53 $(STRICT_CFLAGS) -c driver/sm5800_hal.c -o $(BUILD_DIR)/a53/sm5800_hal.o
+	$(A64_CC) -mcpu=cortex-a53 $(STRICT_CFLAGS) -c driver/sm5800_drv.c -o $(BUILD_DIR)/a53/sm5800_drv.o
+	$(A64_CC) -mcpu=cortex-a53 $(STRICT_CFLAGS) -c driver/sm5800_ps_example.c -o $(BUILD_DIR)/a53/sm5800_ps_example.o
+	$(A64_OBJDUMP) -d $(BUILD_DIR)/a53/sm5800_drv.o > $(BUILD_DIR)/a53/sm5800_drv.dis
+	@echo "AArch64 objects, .su and disassembly generated in $(BUILD_DIR)/a53/"
 
 clean:
 	rm -rf $(BUILD_DIR) xsim.dir obj_dir *.jou *.log *.pb *.wdb *.vvp *.vcd

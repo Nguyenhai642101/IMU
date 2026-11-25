@@ -101,6 +101,8 @@ sequenceDiagram
 - **Máy trạng thái ghi độc lập AW/W:** Lưu độc lập cờ `aw_captured_r` và `w_captured_r`. Các tín hiệu `s_axi_awready`, `s_axi_wready`, `s_axi_arready` đều là ngõ ra thanh ghi (0 đường tổ hợp từ `*VALID`), tránh deadlock trên AXI Interconnect.
 - **Cơ chế Snapshot `CTRL.DATA_LOCK`:** Trên sườn lên `0 → 1` của `CTRL[1]`, toàn bộ 16 thanh ghi dữ liệu + timestamp được chốt đồng thời vào `shd_*_r`. Khi `DATA_LOCK == 0`, bộ chọn đọc đi thẳng từ `live_*_i` (độ trễ 0 chu kỳ).
 - **Ngắt W1C không mất sự kiện:** `int_status_r <= (int_status_r & ~sw_w1c_mask_w) | hw_int_events_w;` đảm bảo xung phần cứng mới đến cùng chu kỳ với lệnh xóa phần mềm không bị nuốt mất.
+- **Tái kích `irq_o` (re-arm):** mọi lần ghi W1C vào `INT_STATUS` ép `irq_o` xuống 0 trong 1 chu kỳ; nếu còn cờ được cho phép (đến trước hoặc trong lúc ISR chạy), `irq_o` lên lại tạo cạnh mới. Nhờ vậy GIC cấu hình kích cạnh (`0x03`) không bị kẹt `irq_o = 1` vĩnh viễn; GIC kích mức (`0x01`) không bị ảnh hưởng.
+- **Khoảng ân hạn watchdog theo datasheet (`sm5800_msg_parser`):** `wd_grace_us_r` = `C_ACTIVATION_GRACE_US` sau reset/soft-reset/nhả `RESET_L`, = max(hiện tại, `C_BIT_GRACE_US`) khi nhả `BIT_L`, về 0 ở khung hợp lệ đầu tiên; watchdog hết hạn khi `idle ≥ TIMEOUT_CFG + wd_grace_us_r` (phép cộng 33 bit, không tràn).
 
 ---
 
@@ -110,11 +112,11 @@ sequenceDiagram
 Mọi trường bit được định nghĩa thuần bằng cặp `_MASK` / `_SHIFT` kiểu không dấu (`U`), tuyệt đối không dùng C bit-field để tránh phụ thuộc trình biên dịch.
 
 ### 3.2 `SDD-SM5800-2.2` — Lớp HAL (`driver/sm5800_hal.h` / `.c`)
-- **Cô lập phần cứng tại biên module:** Không dùng `#ifdef` trong thân hàm. File `sm5800_hal.c` triển khai trực tiếp cho **ARM Cortex-A9 (Zynq-7000 PS)**; khi chuyển sang Cortex-A53 (AArch64) hoặc môi trường Unit Test trên PC (mock HAL), chỉ thay thế file `.c` ở bước liên kết (build system).
+- **Cô lập phần cứng tại biên module:** `sm5800_drv.c` không dùng `#ifdef`. Chỉ `sm5800_hal.c` chọn tập lệnh theo trình biên dịch: `__aarch64__` cho **Cortex-A53 (Zynq UltraScale+ APU)**, `__arm__` cho **Cortex-A9 (Zynq-7000)** và **Cortex-R5 (RPU)**; CPU khác dừng build bằng `#error`. Môi trường Unit Test trên PC thay file `.c` bằng mock HAL ở bước liên kết.
 - **Chi tiết hàm (`2.2.1`–`2.2.6`):**
   - `2.2.1` / `2.2.2`: `sm5800_hal_read_reg()` / `sm5800_hal_write_reg()` — nơi duy nhất thực hiện ép kiểu `uintptr_t → volatile uint32_t *` (ghi nhận ngoại lệ `DEV-001` cho MISRA 11.4).
-  - `2.2.3` / `2.2.4`: `sm5800_hal_dmb()` / `sm5800_hal_dsb()` — rào cản bộ nhớ ARM (`DEV-002`) đảm bảo đồng bộ dữ liệu ISR ↔ Main và xả đường ống ghi AXI4-Lite trước khi thoát ISR.
-  - `2.2.5`: `sm5800_hal_enter_crit()` / `sm5800_hal_exit_crit()` — đọc `CPSR`, tắt IRQ bằng `cpsid i`, chỉ bật lại `cpsie i` nếu IRQ đang mở trước khi vào (hỗ trợ lồng nhau an toàn).
+  - `2.2.3` / `2.2.4`: `sm5800_hal_dmb()` / `sm5800_hal_dsb()` — rào cản bộ nhớ ARM `dmb sy` / `dsb sy`, dùng được cho cả ARMv7 và AArch64 (`DEV-002`) đảm bảo đồng bộ dữ liệu ISR ↔ Main và xả đường ống ghi AXI4-Lite trước khi thoát ISR.
+  - `2.2.5`: `sm5800_hal_enter_crit()` / `sm5800_hal_exit_crit()` — ARMv7: đọc `CPSR`, tắt IRQ bằng `cpsid i`, chỉ bật lại `cpsie i` nếu IRQ đang mở trước khi vào; AArch64: đọc `DAIF`, tắt bằng `msr daifset, #2`, bật lại bằng `msr daifclr, #2` (bit I đều là bit 7; hỗ trợ lồng nhau an toàn).
   - `2.2.6`: `SM5800_ASSERT(expr)` — biên dịch thành `((void)0)` khi không bật `SM5800_ENABLE_ASSERT` để đạt 100% phủ MC/DC ở bản release.
 
 ### 3.3 `SDD-SM5800-3.0` – `3.2` — Kiểu dữ liệu, SEU & Tính toàn vẹn PDI (`driver/sm5800_drv.h`)
@@ -156,7 +158,8 @@ Mọi trường bit được định nghĩa thuần bằng cặp `_MASK` / `_SHI
   - Mỗi khung hàm đơn lẻ đều dưới `128 B` (khuyến nghị kiểm chứng với `-Wstack-usage=256 -fstack-usage`), mọi buffer cục bộ đều **≤ 64 byte** (`sm5800_msg2_raw_t = 56 B`, `sm5800_msg2_eng_t = 60 B`, `serial_octets = 19 B`).
 
 ### 3.6 `SDD-SM5800-4.0` – `4.7` — Ứng dụng mẫu PS (`driver/sm5800_ps_example.c`)
-- `4.0`–`4.2`: Khởi tạo tĩnh handle, ánh xạ `sm5800_ps_gic_isr()` vào GIC, vòng lặp đọc có cận trên `APP_MAX_POLL_CYCLES`.
+- `4.0`–`4.2`: Khởi tạo tĩnh handle, vòng lặp đọc có cận trên `APP_MAX_POLL_CYCLES`.
+- `4.1` (`init_irq_path`, `service_irq_polling`): nối `irq_o` → GIC → `sm5800_ps_gic_isr()` bằng driver `XScuGic` khi có Xilinx BSP (tự nhận biết bằng `__has_include("xscugic.h")`, hỗ trợ cả luồng SDT), kích mức cao vì `irq_o` giữ mức 1 đến khi W1C. Gọi sau `sm5800_init()` để ISR đã sẵn sàng. Không có BSP hoặc `APP_FORCE_IRQ_POLLING`: polling `INT_STATUS` trong vòng lặp chính (dùng để phân biệt lỗi nối dây ngắt với lỗi IP/cảm biến).
 - `4.3` (`init_imu_100hz`): Tạo PDI `is_msg2_only = true`, tính CRC-32 và gọi `sm5800_init()`.
 - `4.4` (`handle_msg2_and_faults`, `is_rate_plausible`): mẫu có tốc độ quay bão hòa (|ω| ≥ 18.5 rad/s ở bất kỳ trục nào; full-scale 16-bit = 18,75 rad/s) bị loại, đếm vào `g_rate_reject_count` và không ghi đè mẫu tốt gần nhất. Ngưỡng cần thay bằng dải đo định mức trong datasheet SM-5800.
 - `4.4` & `4.6` (`run_commanded_bit_cycle`): Tự động ra lệnh `RESET_L > 1 ms` khi `has_module_failed == true`, hoặc chạy chu trình **Commanded BIT (`BIT_L`)** khi phát hiện cờ `bit_fault_mask != 0`.
@@ -173,7 +176,7 @@ Mọi trường bit được định nghĩa thuần bằng cặp `_MASK` / `_SHI
 | `HLR-SM5800-03` | `LLR-SM5800-RTL-002`, `003` | `SDD-SM5800-1.1` | `rtl/sm5800_clk_ctrl.v` | `[T9]`, `[T10]` |
 | `HLR-SM5800-01` | `LLR-SM5800-RTL-004` | `SDD-SM5800-1.2` | `rtl/sm5800_crc16_ccitt.v` | Bit-exact PS, `[T3]`, `[T4]`, `[T7]` |
 | `HLR-SM5800-01` | `LLR-SM5800-RTL-005` | `SDD-SM5800-1.3` | `rtl/sm5800_sdlc_rx.v` | Bit-exact PS, `[T2]`–`[T4]`, `[T7]` |
-| `HLR-SM5800-02` | `LLR-SM5800-RTL-006`–`009` | `SDD-SM5800-1.4` | `rtl/sm5800_msg_parser.v`, `rtl/sm5800_imu_axi_top.v` | `[T3]`–`[T8]`, `[T11]`–`[T16]` |
+| `HLR-SM5800-02` | `LLR-SM5800-RTL-006`–`009` | `SDD-SM5800-1.4` | `rtl/sm5800_msg_parser.v`, `rtl/sm5800_imu_axi_top.v` | `[T3]`–`[T8]`, `[T11]`–`[T18]` |
 | `HLR-SM5800-02`, `04` | `LLR-SM5800-RTL-010`–`012` | `SDD-SM5800-1.5` | `rtl/sm5800_axi4_lite_if.v` | `[T1]`, `[T3]`, `[T4]`, `[T6]`, `[T12]`, `[T13]` |
 | `HLR-SM5800-02` | `LLR-SM5800-REG-001` | `SDD-SM5800-2.1` | `driver/sm5800_regs.h` | Static Audit, `TC-DRV-01` |
 | `HLR-SM5800-05` | `LLR-SM5800-HAL-001`–`006` | `SDD-SM5800-2.2.1`–`2.2.6` | `driver/sm5800_hal.h`, `driver/sm5800_hal.c` | Static Audit, `DEV-001/002`, `TC-DRV-01` |

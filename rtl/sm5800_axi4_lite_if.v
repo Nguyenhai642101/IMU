@@ -9,7 +9,8 @@
 //               - Atomic Snapshot / Shadow Lock (CTRL.DATA_LOCK) preventing
 //                 multi-register data tearing across 600 Hz / 100 Hz updates.
 //               - Lossless W1C interrupt status (HW set overrides SW W1C)
-//                 and glitch-free registered IRQ output.
+//                 and glitch-free registered IRQ output, re-armed (1-cycle low)
+//                 by every W1C write so edge- and level-triggered GICs both work.
 //               - 32-bit sign extension on 16-bit signed Motion Control fields.
 //==============================================================================
 
@@ -171,11 +172,14 @@ module sm5800_axi4_lite_if #(
 
     //--------------------------------------------------------------------------
     // Elaboration-time guard: the register decoder uses ADDR[7:2] and a fixed
-    // 32-bit data path, so other widths would silently misbehave.
+    // 32-bit data path, so other widths would silently misbehave. An illegal
+    // width connects a non-existent port of sm5800_param_error (see that file).
     //--------------------------------------------------------------------------
     generate
         if ((C_S_AXI_ADDR_WIDTH < 8) || (C_S_AXI_DATA_WIDTH != 32)) begin : g_err_axi
-            SM5800_PARAM_ERROR_AXI_ADDR_LT_8_OR_DATA_NOT_32 u_param_error ();
+            /* verilator lint_off PINNOTFOUND */
+            sm5800_param_error u_param_error (.SM5800_PARAM_ERROR_AXI_ADDR_LT_8_OR_DATA_NOT_32(1'b0));
+            /* verilator lint_on PINNOTFOUND */
         end
     endgenerate
 
@@ -436,8 +440,13 @@ module sm5800_axi4_lite_if #(
             // Lossless Interrupt Status: HW set takes priority over SW W1C clear
             int_status_r <= int_status_next_w;
 
-            // Registered glitch-free interrupt output (deasserts same cycle as W1C BVALID)
-            irq_r <= |(int_status_next_w & int_enable_next_w);
+            // Registered glitch-free interrupt output (deasserts same cycle as W1C BVALID).
+            // Every W1C write forces irq_o low for one cycle: if an enabled flag is
+            // still pending (set before or during the ISR), irq_o rises again and
+            // an EDGE-triggered GIC sees a new rising edge instead of a line stuck
+            // high forever. Harmless for a level-triggered GIC.
+            irq_r <= (|(int_status_next_w & int_enable_next_w)) &&
+                     (sw_w1c_mask_w == 7'b000_0000);
 
             // AXI Register Writes
             if (wr_fire_w) begin

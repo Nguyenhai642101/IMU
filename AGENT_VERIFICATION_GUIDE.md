@@ -32,13 +32,13 @@ Agent kiểm tra phải thực hiện **tuần tự** các cổng sau, ghi lại
 powershell -ExecutionPolicy Bypass -File scripts/verify_project.ps1
 ```
 - **Tiêu chí đạt:** `Exit code = 0` và `OVERALL OFFLINE VERIFICATION: PASS (0 violations)` trên cả 5 cổng con:
-  - `Gate A`: Đủ 28 tệp cấu thành dự án.
+  - `Gate A`: Đủ 29 tệp cấu thành dự án.
   - `Gate B`: Thuần Verilog-2001 (`default_nettype none/wire`, 0 từ khóa SV, cân bằng khối, 100% kết nối cổng khớp giữa `rtl/` và `tb/`).
   - `Gate C`: Khớp toán học CRC-16-CCITT (`0x906E`, `0xF0B8`) và tách khung SDLC Msg ID 02 (44 byte có bit-stuffing).
   - `Gate D`: 0 vi phạm C Rules trên toàn bộ `driver/*.h`, `driver/*.c` (dòng ≤ 80, ngoặc Allman, 0 `//`, 0 tab, 0 từ mơ hồ, ID ≤ 31, hàm ≤ 100 dòng, 0 `? :`, 0 từ khóa cấm).
   - `Gate E`: Khớp 100% địa chỉ thanh ghi `rtl/sm5800_axi4_lite_if.v ↔ driver/sm5800_regs.h` và khớp 100% truy vết `@req`/`@design` ↔ `docs/LLR_SM5800.md` / `docs/SDD_SM5800.md`.
 
-### Gate 2 — Mô phỏng RTL & Lint phần cứng (`[T1]`–`[T16]`)
+### Gate 2 — Mô phỏng RTL & Lint phần cứng (`[T1]`–`[T18]`)
 Chạy một trong các trình mô phỏng sau (ưu tiên tất cả các công cụ có sẵn trên máy):
 ```bash
 # Icarus Verilog
@@ -51,7 +51,7 @@ make xsim
 make lint-rtl
 ```
 - **Tiêu chí đạt:**
-  - `ALL TESTS PASSED! (... assertions passed, 0 errors)` trên toàn bộ 16 kịch bản `[T1]`–`[T16]`.
+  - `ALL TESTS PASSED! (... assertions passed, 0 errors)` trên toàn bộ 18 kịch bản `[T1]`–`[T18]`.
   - Xác nhận `[T10]` đo xung `RESET_L` thấp **> 1,000,000 ns (> 1.0 ms)**.
   - Xác nhận `[T13]` ở chế độ `MSG2_ONLY_MODE = 1`: Msg 01 không gây `irq_o` và không ghi đè dữ liệu Msg 02; Msg 02 cập nhật đủ 14 trường và dựng `irq_o = 1`.
 
@@ -67,6 +67,7 @@ make test-c
 ### Gate 4 — Biên dịch chéo ARM Cortex-A9 PS & Kiểm tra mã máy ISR
 ```bash
 make build-arm
+make build-arm64   # Zynq UltraScale+ Cortex-A53 (AArch64)
 ```
 - **Tiêu chí đạt:**
   - Cả 3 tệp `sm5800_hal.c`, `sm5800_drv.c`, `sm5800_ps_example.c` biên dịch **0 warning / 0 error**.
@@ -96,7 +97,7 @@ Khi hoàn tất rà soát, Agent kiểm tra xuất báo cáo theo cấu trúc ng
 ```markdown
 ## Independent Verification Summary — SM-5800 IMU Project
 - Gate 1 (verify_project.ps1): [PASS / FAIL] — <chi tiết>
-- Gate 2 (RTL Sim [T1]-[T16] & Lint): [PASS / FAIL / BLOCKED] — <công cụ & log>
+- Gate 2 (RTL Sim [T1]-[T18] & Lint): [PASS / FAIL / BLOCKED] — <công cụ & log>
 - Gate 3 (Host C Unit Tests TC-DRV-01..17): [PASS / FAIL / BLOCKED] — <pass/fail count, max .su stack>
 - Gate 4 (ARM GCC Build & ISR Disasm): [PASS / FAIL / BLOCKED] — <warning count, VFP check>
 - Gate 5 (Manual Deep Review): [PASS / ISSUES FOUND] — <liệt kê file:line nếu có lỗi>
